@@ -4,8 +4,8 @@ TARGET?=gpioevtd
 CFLAGS+=-Wall -Wextra -g -O2
 LDFLAGS+=-lpthread
 
-all: gpioevtd.c
-	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $(TARGET)
+all: gpioevtd.c circular_buffer.c
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $(TARGET)
 
 clean:
 	rm -f $(TARGET)
