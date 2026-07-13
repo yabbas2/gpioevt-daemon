@@ -1,70 +1,37 @@
-#include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
 #include <signal.h>
-#include <stdbool.h>
 #include <stdio.h>
-#include <string.h>
-#include <sys/types.h>
+#include <sys/eventfd.h>
 #include <syslog.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "circular_buffer.h"
-#include "common.h"
+#include "reader.h"
+#include "tcp_server.h"
 
 #define UNUSED(x) (void)(x)
 #define DEVICE_FILE "/dev/gpioevt"
-#define LOG_SIZE 100
+#define BUF_SIZE 100
+#define TCP_PORT 9090
 
-static volatile bool running = true;
-static circ_buf_t log;
+static volatile sig_atomic_t running = 1;
+static circ_buf_t buffer;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static int event_fd;
 
 static void sigint_handler(int sig) {
     UNUSED(sig);
-    running = false;
-}
-
-static void time_to_string(char *timebuf, size_t size, uint64_t ts) {
-    snprintf(timebuf, size, "%llu", (unsigned long long)ts);
-}
-
-static void *reader_thread(void *arg) {
-    UNUSED(arg);
-
-    int fd = open(DEVICE_FILE, O_RDONLY, 0400);
-    if (fd < 0) {
-        perror("open");
-        return NULL;
-    }
-
-    union data_entry data;
-
-    while (running) {
-        ssize_t n = read(fd, data.serialized, DATA_ENTRY_SIZE); // driver will not return partial data
-        if (n < 0) {
-            perror("read");
-            break;
-        }
-
-        char timebuf[64];
-        time_to_string(timebuf, sizeof(timebuf), data.deserialized.timestamp);
-        syslog(LOG_INFO, "[%s] pin: %d, level: %d", timebuf, data.deserialized.pin, data.deserialized.level);
-    }
-
-    close(fd);
-    return NULL;
+    running = 0;
 }
 
 int main() {
     int ret;
+
 #ifndef DEBUG
-    ret = daemon(0, 0); // convert to daemon
+    ret = daemon(0, 0);
     if (ret != 0) {
         perror("daemon");
         return 1;
     }
-    printf("gpioevtd started in daemon mode.\n");
     openlog("gpioevtd", LOG_PID, LOG_DAEMON);
 #else
     printf("gpioevtd started in debug mode.\n");
@@ -81,26 +48,76 @@ int main() {
     sigfillset(&sigterm_action.sa_mask);
     sigaction(SIGTERM, &sigterm_action, NULL);
 
-    ret = circ_buf_init(&log, LOG_SIZE);
+    ret = circ_buf_init(&buffer, BUF_SIZE);
     if (ret != 0) {
+        syslog(LOG_ERR, "main: failed to init circular buffer");
         return 1;
     }
 
-    pthread_t reader_tid;
-    ret = pthread_create(&reader_tid, NULL, reader_thread, NULL);
-    if (ret != 0) {
-        perror("pthread_create");
+    event_fd = eventfd(0, EFD_NONBLOCK);
+    if (event_fd < 0) {
+        syslog(LOG_ERR, "main: eventfd failed: %m");
+        circ_buf_deinit(&buffer);
         return 1;
     }
+
+    reader_ctx_t reader_ctx = {
+        .device_path = DEVICE_FILE,
+        .buffer = &buffer,
+        .mutex = &mutex,
+        .event_fd = event_fd,
+        .running = &running,
+    };
+
+    tcp_server_ctx_t tcp_ctx = {
+        .port = TCP_PORT,
+        .event_fd = event_fd,
+        .buffer = &buffer,
+        .mutex = &mutex,
+        .running = &running,
+    };
+
+    ret = tcp_server_init(&tcp_ctx);
+    if (ret != 0) {
+        syslog(LOG_ERR, "main: tcp_server_init failed");
+        close(event_fd);
+        circ_buf_deinit(&buffer);
+        return 1;
+    }
+
+    pthread_t reader_tid, tcp_tid;
+
+    ret = pthread_create(&reader_tid, NULL, reader_thread, &reader_ctx);
+    if (ret != 0) {
+        syslog(LOG_ERR, "main: pthread_create reader failed: %m");
+        close(event_fd);
+        circ_buf_deinit(&buffer);
+        return 1;
+    }
+
+    ret = pthread_create(&tcp_tid, NULL, tcp_server_thread, &tcp_ctx);
+    if (ret != 0) {
+        syslog(LOG_ERR, "main: pthread_create tcp_server failed: %m");
+        running = 0;
+        pthread_join(reader_tid, NULL);
+        close(event_fd);
+        circ_buf_deinit(&buffer);
+        return 1;
+    }
+
+    syslog(LOG_INFO, "main: gpioevtd started on port %d", TCP_PORT);
 
     while (running) {
-        syslog(LOG_INFO, "gpioevtd running.");
         sleep(10);
     }
 
-    printf("gpioevtd exiting.\n");
+    syslog(LOG_INFO, "main: shutting down");
+
     pthread_join(reader_tid, NULL);
-    circ_buf_deinit(&log);
+    pthread_join(tcp_tid, NULL);
+
+    close(event_fd);
+    circ_buf_deinit(&buffer);
     closelog();
     return 0;
 }

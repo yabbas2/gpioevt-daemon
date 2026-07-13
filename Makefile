@@ -4,7 +4,7 @@ TARGET?=gpioevtd
 CFLAGS+=-Wall -Wextra -g -O2
 LDFLAGS+=-lpthread
 
-all: gpioevtd.c circular_buffer.c
+all: gpioevtd.c circular_buffer.c tcp_server.c reader.c
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $(TARGET)
 
 clean:

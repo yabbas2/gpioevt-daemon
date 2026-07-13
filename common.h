@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 struct struct_data {
-    uint64_t timestamp;
+    int64_t timestamp;
     unsigned char pin;
     unsigned char level;
 } __attribute__((packed));
